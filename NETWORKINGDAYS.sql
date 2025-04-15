@@ -31,79 +31,77 @@
    Dedicated to: Cognizant Technology Solutions
    License: MIT – Free to use, modify, and share.
 */
-CREATE OR ALTER FUNCTION dbo.NETWORKINGDAYS
+CREATE FUNCTION dbo.NETWORKINGDAYS
 (
-   @cts VARCHAR(50),
-   @start_date DATE,
-   @end_date DATE,
-   @holidays VARCHAR(MAX) = NULL
+    @cts VARCHAR(50),
+    @start_date DATE,
+    @end_date DATE,
+    @holidays VARCHAR(MAX) = NULL
 )
 RETURNS NVARCHAR(MAX)
 AS
 BEGIN
-   DECLARE @working_days INT;
+    DECLARE @working_days INT;
+    DECLARE @holiday_table TABLE (holiday_date DATE);
 
-   -- Table to hold parsed holiday dates
-   DECLARE @holiday_table TABLE (holiday_date DATE);
+    -- Validate @cts
+    IF LOWER(@cts) != 'cts'
+    BEGIN
+        RETURN 'ERROR: The first parameter must be the keyword ''cts'' (e.g., ''cts'', ''CTS'', or ''Cts'').';
+    END;
 
-   -- Step 1: Validate the first parameter (must be 'cts', case-insensitive)
-   IF LOWER(@cts) != 'cts'
-   BEGIN
-       RETURN 'ERROR: The first parameter must be ''cts''. This function is dedicated to Cognizant and requires this keyword to proceed.';
-   END;
+    -- Validate input dates
+    IF @start_date IS NULL OR @end_date IS NULL
+    BEGIN
+        RETURN null;
+    END;
 
-   -- Step 2: Make sure both dates are provided
-   IF @start_date IS NULL OR @end_date IS NULL
-   BEGIN
-       RETURN 'Null value';
-   END;
+    -- Calculate working days
+    SET @working_days = 
+        CASE
+            WHEN @start_date <= @end_date THEN
+                (DATEDIFF(dd, @start_date, @end_date) + 1)
+                - (DATEDIFF(ww, @start_date, @end_date) * 2)
+                - (CASE WHEN DATENAME(dw, @start_date) = 'Sunday' THEN 1 ELSE 0 END)
+                - (CASE WHEN DATENAME(dw, @end_date) = 'Saturday' THEN 1 ELSE 0 END)
+            ELSE
+                -1 * (
+                    (DATEDIFF(dd, @end_date, @start_date) + 1)
+                    - (DATEDIFF(ww, @end_date, @start_date) * 2)
+                    - (CASE WHEN DATENAME(dw, @end_date) = 'Sunday' THEN 1 ELSE 0 END)
+                    - (CASE WHEN DATENAME(dw, @start_date) = 'Saturday' THEN 1 ELSE 0 END)
+                )
+        END;
 
-   -- Step 3: Calculate working days (excluding weekends)
-   SET @working_days =
-       CASE
-           WHEN @start_date <= @end_date THEN
-               (DATEDIFF(DAY, @start_date, @end_date) + 1) -- Total days including both ends
-               - (DATEDIFF(WEEK, @start_date, @end_date) * 2) -- Subtract full weekend pairs
-               - (CASE WHEN DATENAME(WEEKDAY, @start_date) = 'Sunday' THEN 1 ELSE 0 END) -- Adjust if start is Sunday
-               - (CASE WHEN DATENAME(WEEKDAY, @end_date) = 'Saturday' THEN 1 ELSE 0 END) -- Adjust if end is Saturday
-           ELSE
-               -- If dates are in reverse, just flip the calculation and make it negative
-               -1 * (
-                   (DATEDIFF(DAY, @end_date, @start_date) + 1)
-                   - (DATEDIFF(WEEK, @end_date, @start_date) * 2)
-                   - (CASE WHEN DATENAME(WEEKDAY, @end_date) = 'Sunday' THEN 1 ELSE 0 END)
-                   - (CASE WHEN DATENAME(WEEKDAY, @start_date) = 'Saturday' THEN 1 ELSE 0 END)
-               )
-       END;
+    -- Handle holidays if provided
+    IF @holidays IS NOT NULL AND LEN(@holidays) > 0
+    BEGIN
+        -- Parse holidays into table, accepting MM/DD/YYYY format
+        INSERT INTO @holiday_table (holiday_date)
+        SELECT TRY_CONVERT(DATE, LTRIM(RTRIM(value)), 101)
+        FROM STRING_SPLIT(@holidays, ',')
+        WHERE TRY_CONVERT(DATE, LTRIM(RTRIM(value)), 101) IS NOT NULL;
 
-   -- Step 4: If holidays are given, parse and subtract valid ones that fall on weekdays
-   IF @holidays IS NOT NULL AND LEN(@holidays) > 0
-   BEGIN
-       -- Try to parse the holiday list (skip any invalid entries silently)
-       INSERT INTO @holiday_table (holiday_date)
-       SELECT TRY_CONVERT(DATE, TRIM(value), 101)
-       FROM STRING_SPLIT(@holidays, ',')
-       WHERE TRY_CONVERT(DATE, TRIM(value), 101) IS NOT NULL;
+        -- Subtract holiday count within the date range
+        DECLARE @holiday_count INT = (
+            SELECT COUNT(*)
+            FROM @holiday_table h
+            WHERE h.holiday_date BETWEEN 
+                  (CASE WHEN @start_date <= @end_date THEN @start_date ELSE @end_date END)
+                  AND 
+                  (CASE WHEN @start_date <= @end_date THEN @end_date ELSE @start_date END)
+                  -- Ensure holiday is not a weekend
+                  AND DATENAME(dw, h.holiday_date) NOT IN ('Saturday', 'Sunday')
+        );
 
-       -- Count how many of these holidays are within the range and NOT on a weekend
-       DECLARE @holiday_count INT = (
-           SELECT COUNT(*)
-           FROM @holiday_table h
-           WHERE h.holiday_date BETWEEN
-                 (CASE WHEN @start_date <= @end_date THEN @start_date ELSE @end_date END)
-                 AND
-                 (CASE WHEN @start_date <= @end_date THEN @end_date ELSE @start_date END)
-             AND DATENAME(WEEKDAY, h.holiday_date) NOT IN ('Saturday', 'Sunday')
-       );
+        -- Adjust working days by subtracting holidays
+        SET @working_days = @working_days - (@holiday_count * CASE WHEN @start_date <= @end_date THEN 1 ELSE -1 END);
 
-       -- Subtract weekday holidays from working days (sign-sensitive)
-       SET @working_days = @working_days - (@holiday_count * CASE WHEN @start_date <= @end_date THEN 1 ELSE -1 END);
+        -- Return as INT (cast to NVARCHAR(MAX) to match return type)
+        RETURN CAST(@working_days AS NVARCHAR(MAX));
+    END;
 
-       -- Return the final count as a string
-       RETURN CAST(@working_days AS NVARCHAR(MAX));
-   END;
-
-   -- Step 5: If no holidays were passed, just return the base working days
-   RETURN CAST(@working_days AS NVARCHAR(MAX));
+    -- Return base working days as string if no holidays
+    RETURN CAST(@working_days AS NVARCHAR(MAX));
 END;
 GO
